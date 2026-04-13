@@ -913,16 +913,13 @@ async def unknown_message(message: Message):
 # ==================== ЗАПУСК ДЛЯ RENDER ====================
 
 async def main():
-    # Инициализируем базу данных
-    init_db()
+    init_db()  # <--- ЭТА СТРОКА ДОБАВЛЯЕТСЯ!
     
-    # Для Render используем webhook
     webhook_url = os.getenv("WEBHOOK_URL")
     if webhook_url:
         await bot.set_webhook(webhook_url)
         logging.info(f"✅ Webhook установлен: {webhook_url}")
     else:
-        # Для локальной разработки - polling
         await bot.delete_webhook(drop_pending_updates=True)
         logging.info("✅ Запуск в режиме polling (локальная разработка)")
         await dp.start_polling(bot)
