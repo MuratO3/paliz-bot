@@ -79,7 +79,7 @@ def init_db():
         ''')
         
         # Таблица товаров
-        cursor.execute(''^')
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 farmer_id INTEGER,
