@@ -293,7 +293,7 @@ def get_user_orders(user_id: int) -> List[Dict]:
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT o.id, p.name, o.quantity, o.total_price, o.status, o.created_at, o.delivery_method
+            SELECT o.id, p.name, p.unit, o.quantity, o.total_price, o.status, o.created_at, o.delivery_method
             FROM orders o
             JOIN products p ON o.product_id = p.id
             WHERE o.user_id = ?
@@ -301,8 +301,8 @@ def get_user_orders(user_id: int) -> List[Dict]:
         ''', (user_id,))
         rows = cursor.fetchall()
         return [{
-            'id': row[0], 'product_name': row[1], 'quantity': row[2],
-            'total_price': row[3], 'status': row[4], 'created_at': row[5], 'delivery_method': row[6]
+            'id': row[0], 'product_name': row[1], 'unit': row[2], 'quantity': row[3],
+            'total_price': row[4], 'status': row[5], 'created_at': row[6], 'delivery_method': row[7]
         } for row in rows]
 
 def add_user(user_id: int, username: str = None, full_name: str = None):
@@ -875,7 +875,7 @@ async def show_orders(message: Message):
         status = status_emoji.get(order['status'], '📌')
         delivery_icon = "📍" if order['delivery_method'] == 'pickup' else "🚛"
         text += (f"{status} *Заказ #{order['id']}*\n"
-                f"📦 {order['product_name']} — {order['quantity']} шт\n"
+                f"📦 {order['product_name']} — {order['quantity']} {order['unit']}\n"  # <--- ЗДЕСЬ ИСПРАВЛЕНО!
                 f"💰 {order['total_price']} сум\n"
                 f"{delivery_icon} {order['delivery_method']}\n"
                 f"🕐 {order['created_at'][:16]}\n\n")
