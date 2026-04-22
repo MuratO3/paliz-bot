@@ -42,24 +42,17 @@ def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         
-        # Таблица пользователей
+        # ========== ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ ==========
         cursor.execute('''
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        farmer_id INTEGER,
-        category_id INTEGER,
-        name TEXT,
-        description TEXT,
-        price INTEGER,
-        unit TEXT,
-        stock REAL,
-        photo_id TEXT,
-        is_active BOOLEAN DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (farmer_id) REFERENCES farmers (id),
-        FOREIGN KEY (category_id) REFERENCES categories (id)
-    )
-''')
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                phone TEXT,
+                role TEXT DEFAULT 'buyer',
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
         # Таблица фермеров
         cursor.execute('''
@@ -118,7 +111,7 @@ def init_db():
                 phone TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id),
+                FOREIGN KEY (user_id) REFERENCES users (id),
                 FOREIGN KEY (farmer_id) REFERENCES farmers (id),
                 FOREIGN KEY (product_id) REFERENCES products (id)
             )
