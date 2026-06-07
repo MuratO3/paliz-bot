@@ -1375,6 +1375,7 @@ async def start_http_server():
     app.router.add_get('/', handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
+    port = int(os.environ.get('PORT', 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"✅ HTTP сервер запущен на порту {port}")
