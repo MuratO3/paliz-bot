@@ -1,15 +1,15 @@
 ﻿"""
-Paliz Market Bot - Агро-маркетплейс для Нукуса
-Полностью рабочий код для деплоя на Render.com
+Paliz Market Bot - Полная версия
+С ролями, геолокацией, Supabase, каталогом, сортировкой
 """
 
-import sqlite3
 import asyncio
 import logging
 import os
-import json
+import uuid
+import math
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Any
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -18,369 +18,513 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp import web
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
-# Загружаем переменные окружения из .env файла
 load_dotenv()
 
-from aiohttp import web
-
-# Простой HTTP-сервер для Keep-Alive
-async def handle_health(request):
-    return web.Response(text="✅ Paliz Market bot is running!")
-
-async def start_http_server():
-    app = web.Application()
-    app.router.add_get('/health', handle_health)
-    app.router.add_get('/', handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080)))
-    await site.start()
-    logging.info("✅ HTTP Keep-Alive сервер запущен на порту 8080")
-    
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(os.getenv("ADMIN_ID"))] if os.getenv("ADMIN_ID") else []
 
-# Проверка наличия токена
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден в переменных окружения!")
+    raise ValueError("BOT_TOKEN не найден!")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL и SUPABASE_KEY обязательны!")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO)
 
-# ==================== БАЗА ДАННЫХ ====================
+# ==================== КЭШ ГЕОЛОКАЦИИ ПОКУПАТЕЛЕЙ ====================
+user_location_cache = {}
 
-DB_NAME = "paliz.db"
+# ==================== ФУНКЦИИ РАССТОЯНИЯ ====================
 
-def init_db():
-    """Создаёт все таблицы при первом запуске"""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        
-        # ========== ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ ==========
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                phone TEXT,
-                role TEXT DEFAULT 'buyer',
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Таблица фермеров
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS farmers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER UNIQUE,
-                farm_name TEXT,
-                address TEXT,
-                latitude REAL,
-                longitude REAL,
-                phone TEXT,
-                work_hours TEXT,
-                is_approved BOOLEAN DEFAULT 0,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-        
-        # Таблица категорий
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE
-            )
-        ''')
-        
-        # Таблица товаров
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                farmer_id INTEGER,
-                category_id INTEGER,
-                name TEXT,
-                description TEXT,
-                price INTEGER,
-                unit TEXT,
-                stock REAL,
-                photo_id TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (farmer_id) REFERENCES farmers (id),
-                FOREIGN KEY (category_id) REFERENCES categories (id)
-            )
-        ''')
-        
-        # Таблица заказов
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                farmer_id INTEGER,
-                product_id INTEGER,
-                quantity REAL,
-                total_price INTEGER,
-                delivery_method TEXT,
-                address TEXT,
-                phone TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id),
-                FOREIGN KEY (farmer_id) REFERENCES farmers (id),
-                FOREIGN KEY (product_id) REFERENCES products (id)
-            )
-        ''')
-        
-        # Таблица корзины
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS cart (
-                user_id INTEGER,
-                product_id INTEGER,
-                farmer_id INTEGER,
-                quantity REAL,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, product_id)
-            )
-        ''')
-        
-        # Добавляем тестовые категории
-        cursor.execute("SELECT COUNT(*) FROM categories")
-        if cursor.fetchone()[0] == 0:
-            categories = ['Овощи', 'Фрукты', 'Зелень', 'Молочные продукты', 'Хлеб и выпечка']
-            for cat in categories:
-                cursor.execute("INSERT INTO categories (name) VALUES (?)", (cat,))
-        
-        # Добавляем тестового фермера
-        cursor.execute("SELECT COUNT(*) FROM farmers")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute('''
-                INSERT INTO farmers (user_id, farm_name, address, latitude, longitude, phone, work_hours, is_approved)
-                VALUES (1, 'Фермерское хозяйство "Paliz"', 'г. Нукус, ул. Каракалпакская 15', 42.4647, 59.6163, '+998901234567', '09:00 - 18:00', 1)
-            ''')
-        
-        # Добавляем тестовые товары
-        cursor.execute("SELECT COUNT(*) FROM products")
-        if cursor.fetchone()[0] == 0:
-            test_products = [
-                (1, 1, 'Помидоры', 'Свежие, сочные помидоры', 8000, 'кг', 100, None),
-                (1, 2, 'Яблоки', 'Сладкие яблоки', 12000, 'кг', 50, None),
-                (1, 3, 'Укроп', 'Свежая зелень', 2000, 'пучок', 200, None),
-                (1, 4, 'Молоко', 'Домашнее молоко', 15000, 'литр', 30, None),
-                (1, 5, 'Лепёшка', 'Свежая лепёшка', 5000, 'шт', 100, None),
-            ]
-            cursor.executemany('''
-                INSERT INTO products (farmer_id, category_id, name, description, price, unit, stock, photo_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', test_products)
-        
-        conn.commit()
-        print("✅ База данных инициализирована")
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Расстояние между точками в км (формула гаверсинуса)"""
+    if not lat1 or not lon1 or not lat2 or not lon2:
+        return float('inf')
+    
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(min(1, math.sqrt(a)))
+    
+    return round(R * c, 1)
 
 # ==================== ФУНКЦИИ БАЗЫ ДАННЫХ ====================
 
-def get_all_categories() -> List[Dict]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name FROM categories ORDER BY name")
-        rows = cursor.fetchall()
-        return [{'id': row[0], 'name': row[1]} for row in rows]
+def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict]:
+    try:
+        result = supabase.table("users").select("*").eq("user_id", telegram_id).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logging.error(f"get_user_by_telegram_id error: {e}")
+        return None
+
+def add_user(telegram_id: int, username: str = None, full_name: str = None, role: str = 'buyer') -> Optional[Dict]:
+    try:
+        data = {
+            "user_id": telegram_id,
+            "username": username,
+            "full_name": full_name,
+            "role": role,
+            "created_at": datetime.now().isoformat()
+        }
+        result = supabase.table("users").upsert(data).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logging.error(f"add_user error: {e}")
+        return None
+
+def update_user_role(telegram_id: int, role: str) -> bool:
+    try:
+        supabase.table("users").update({"role": role}).eq("user_id", telegram_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"update_user_role error: {e}")
+        return False
+
+def get_all_managers() -> List[Dict]:
+    try:
+        result = supabase.table("users").select("user_id, username").eq("role", "manager").execute()
+        return result.data
+    except Exception as e:
+        logging.error(f"get_all_managers error: {e}")
+        return []
+
+def add_farmer_request(user_id: int, farm_name: str, address: str, phone: str, latitude: float, longitude: float) -> bool:
+    try:
+        data = {
+            "user_id": user_id,
+            "farm_name": farm_name,
+            "address": address,
+            "phone": phone,
+            "latitude": latitude,
+            "longitude": longitude,
+            "status": "pending",
+            "created_at": datetime.now().isoformat()
+        }
+        supabase.table("farmer_requests").insert(data).execute()
+        return True
+    except Exception as e:
+        logging.error(f"add_farmer_request error: {e}")
+        return False
+
+def add_delivery_request(user_id: int, full_name: str, phone: str, vehicle_type: str, latitude: float, longitude: float) -> bool:
+    try:
+        data = {
+            "user_id": user_id,
+            "full_name": full_name,
+            "phone": phone,
+            "vehicle_type": vehicle_type,
+            "latitude": latitude,
+            "longitude": longitude,
+            "status": "pending",
+            "created_at": datetime.now().isoformat()
+        }
+        supabase.table("delivery_requests").insert(data).execute()
+        return True
+    except Exception as e:
+        logging.error(f"add_delivery_request error: {e}")
+        return False
+
+def add_gardener(user_id: int, garden_name: str, address: str, phone: str, latitude: float, longitude: float) -> bool:
+    try:
+        data = {
+            "user_id": user_id,
+            "garden_name": garden_name,
+            "address": address,
+            "phone": phone,
+            "latitude": latitude,
+            "longitude": longitude
+        }
+        supabase.table("gardeners").upsert(data).execute()
+        update_user_role(user_id, "gardener")
+        return True
+    except Exception as e:
+        logging.error(f"add_gardener error: {e}")
+        return False
+
+def get_pending_farmer_requests() -> List[Dict]:
+    try:
+        result = supabase.table("farmer_requests").select("*").eq("status", "pending").execute()
+        return result.data
+    except Exception as e:
+        logging.error(f"get_pending_farmer_requests error: {e}")
+        return []
+
+def get_pending_delivery_requests() -> List[Dict]:
+    try:
+        result = supabase.table("delivery_requests").select("*").eq("status", "pending").execute()
+        return result.data
+    except Exception as e:
+        logging.error(f"get_pending_delivery_requests error: {e}")
+        return []
+
+def approve_farmer_request(request_id: int, user_id: int, farm_name: str, address: str, phone: str, latitude: float, longitude: float) -> bool:
+    try:
+        supabase.table("farmer_requests").update({
+            "status": "approved",
+            "reviewed_at": datetime.now().isoformat()
+        }).eq("id", request_id).execute()
+        
+        farmer_data = {
+            "user_id": user_id,
+            "farm_name": farm_name,
+            "address": address,
+            "phone": phone,
+            "latitude": latitude,
+            "longitude": longitude,
+            "is_approved": True,
+            "approved_at": datetime.now().isoformat()
+        }
+        supabase.table("farmers").upsert(farmer_data).execute()
+        update_user_role(user_id, "farmer")
+        return True
+    except Exception as e:
+        logging.error(f"approve_farmer_request error: {e}")
+        return False
+
+def approve_delivery_request(request_id: int, user_id: int, full_name: str, phone: str, vehicle_type: str, latitude: float, longitude: float) -> bool:
+    try:
+        supabase.table("delivery_requests").update({
+            "status": "approved",
+            "reviewed_at": datetime.now().isoformat()
+        }).eq("id", request_id).execute()
+        
+        delivery_data = {
+            "user_id": user_id,
+            "full_name": full_name,
+            "phone": phone,
+            "vehicle_type": vehicle_type,
+            "latitude": latitude,
+            "longitude": longitude,
+            "is_approved": True,
+            "approved_at": datetime.now().isoformat()
+        }
+        supabase.table("delivery_profiles").upsert(delivery_data).execute()
+        update_user_role(user_id, "delivery")
+        return True
+    except Exception as e:
+        logging.error(f"approve_delivery_request error: {e}")
+        return False
+
+def reject_request(table: str, request_id: int) -> bool:
+    try:
+        supabase.table(table).update({
+            "status": "rejected",
+            "reviewed_at": datetime.now().isoformat()
+        }).eq("id", request_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"reject_request error: {e}")
+        return False
+
+def get_categories() -> List[Dict]:
+    try:
+        result = supabase.table("categories").select("*").order("sort_order").execute()
+        return result.data
+    except Exception as e:
+        logging.error(f"get_categories error: {e}")
+        return []
+
+def get_all_products_with_sellers() -> List[Dict]:
+    """Получить все товары с полной информацией о продавце (фермеры + садоводы)"""
+    try:
+        # Товары фермеров
+        farmer_products = supabase.table("products")\
+            .select("*, farmers!inner(user_id, farm_name, address, latitude, longitude, phone)")\
+            .eq("is_active", True)\
+            .execute()
+        
+        # Товары садоводов
+        gardener_products = supabase.table("products")\
+            .select("*, gardeners!inner(user_id, garden_name, address, latitude, longitude, phone)")\
+            .eq("is_active", True)\
+            .execute()
+        
+        result = []
+        
+        for item in farmer_products.data:
+            result.append({
+                "id": item["id"],
+                "name": item["name"],
+                "price": item["price"],
+                "unit": item["unit"],
+                "stock": item["stock"],
+                "description": item.get("description"),
+                "photo_id": item.get("photo_id"),
+                "category_id": item.get("category_id"),
+                "seller_user_id": item["farmers"]["user_id"],
+                "seller_name": item["farmers"]["farm_name"],
+                "seller_type": "farmer",
+                "seller_address": item["farmers"]["address"],
+                "seller_lat": item["farmers"].get("latitude"),
+                "seller_lon": item["farmers"].get("longitude"),
+                "seller_phone": item["farmers"]["phone"],
+                "badge": "🌾 Верифицированный фермер"
+            })
+        
+        for item in gardener_products.data:
+            result.append({
+                "id": item["id"],
+                "name": item["name"],
+                "price": item["price"],
+                "unit": item["unit"],
+                "stock": item["stock"],
+                "description": item.get("description"),
+                "photo_id": item.get("photo_id"),
+                "category_id": item.get("category_id"),
+                "seller_user_id": item["gardeners"]["user_id"],
+                "seller_name": item["gardeners"]["garden_name"],
+                "seller_type": "gardener",
+                "seller_address": item["gardeners"]["address"],
+                "seller_lat": item["gardeners"].get("latitude"),
+                "seller_lon": item["gardeners"].get("longitude"),
+                "seller_phone": item["gardeners"]["phone"],
+                "badge": "🏠 Садовод (частник)"
+            })
+        
+        return result
+    except Exception as e:
+        logging.error(f"get_all_products_with_sellers error: {e}")
+        return []
 
 def get_products_by_category(category_id: int) -> List[Dict]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT p.id, p.name, p.price, p.unit, p.photo_id, p.stock, p.description, f.farm_name, f.id as farmer_id
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.id
-            WHERE p.category_id = ? AND p.is_active = 1 AND f.is_approved = 1
-        ''', (category_id,))
-        rows = cursor.fetchall()
-        return [{
-            'id': row[0], 'name': row[1], 'price': row[2], 'unit': row[3],
-            'photo_id': row[4], 'stock': row[5], 'description': row[6],
-            'farm_name': row[7], 'farmer_id': row[8]
-        } for row in rows]
+    all_products = get_all_products_with_sellers()
+    return [p for p in all_products if p.get("category_id") == category_id]
 
 def get_product_by_id(product_id: int) -> Optional[Dict]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT p.id, p.name, p.price, p.unit, p.photo_id, p.stock, p.description, p.farmer_id, f.farm_name, f.address, f.latitude, f.longitude
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.id
-            WHERE p.id = ? AND p.is_active = 1
-        ''', (product_id,))
-        row = cursor.fetchone()
-        if row:
-            return {
-                'id': row[0], 'name': row[1], 'price': row[2], 'unit': row[3],
-                'photo_id': row[4], 'stock': row[5], 'description': row[6],
-                'farmer_id': row[7], 'farm_name': row[8], 'address': row[9],
-                'latitude': row[10], 'longitude': row[11]
-            }
-        return None
+    all_products = get_all_products_with_sellers()
+    return next((p for p in all_products if p["id"] == product_id), None)
 
-def get_farmer_info(farmer_id: int) -> Optional[Dict]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT farm_name, address, latitude, longitude, phone, work_hours FROM farmers WHERE id = ?', (farmer_id,))
-        row = cursor.fetchone()
-        if row:
-            return {
-                'farm_name': row[0], 'address': row[1], 'latitude': row[2],
-                'longitude': row[3], 'phone': row[4], 'work_hours': row[5]
-            }
-        return None
-
-def add_to_cart(user_id: int, product_id: int, farmer_id: int, quantity: float = 1):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT quantity FROM cart WHERE user_id = ? AND product_id = ?", (user_id, product_id))
-        row = cursor.fetchone()
-        if row:
-            new_qty = row[0] + quantity
-            cursor.execute("UPDATE cart SET quantity = ?, farmer_id = ? WHERE user_id = ? AND product_id = ?", 
-                          (new_qty, farmer_id, user_id, product_id))
+def add_to_cart(user_id: int, product_id: int, quantity: float = 1) -> bool:
+    try:
+        existing = supabase.table("cart").select("*").eq("user_id", user_id).eq("product_id", product_id).execute()
+        if existing.data:
+            new_qty = existing.data[0]["quantity"] + quantity
+            supabase.table("cart").update({"quantity": new_qty}).eq("user_id", user_id).eq("product_id", product_id).execute()
         else:
-            cursor.execute("INSERT INTO cart (user_id, product_id, farmer_id, quantity) VALUES (?, ?, ?, ?)", 
-                          (user_id, product_id, farmer_id, quantity))
-        conn.commit()
+            data = {
+                "user_id": user_id,
+                "product_id": product_id,
+                "quantity": quantity,
+                "added_at": datetime.now().isoformat()
+            }
+            supabase.table("cart").insert(data).execute()
+        return True
+    except Exception as e:
+        logging.error(f"add_to_cart error: {e}")
+        return False
 
-def get_cart(user_id: int) -> List[Tuple]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT c.product_id, p.name, p.price, c.quantity, (p.price * c.quantity) as total, p.unit, c.farmer_id
-            FROM cart c
-            JOIN products p ON c.product_id = p.id
-            WHERE c.user_id = ?
-        ''', (user_id,))
-        return cursor.fetchall()
+def get_cart(user_id: int) -> List[Dict]:
+    try:
+        result = supabase.table("cart").select("*, products(*)").eq("user_id", user_id).execute()
+        return result.data
+    except Exception as e:
+        logging.error(f"get_cart error: {e}")
+        return []
 
-def is_in_cart(user_id: int, product_id: int) -> bool:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM cart WHERE user_id = ? AND product_id = ?", (user_id, product_id))
-        return cursor.fetchone() is not None
+def clear_cart(user_id: int) -> bool:
+    try:
+        supabase.table("cart").delete().eq("user_id", user_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"clear_cart error: {e}")
+        return False
 
-def clear_cart(user_id: int):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
-        conn.commit()
-
-def get_cart_total(user_id: int) -> int:
-    cart_items = get_cart(user_id)
-    return sum(item[4] for item in cart_items)
-
-def get_cart_farmer_id(user_id: int) -> Optional[int]:
-    cart_items = get_cart(user_id)
-    if cart_items:
-        return cart_items[0][6]
-    return None
-
-def create_order(user_id: int, farmer_id: int, delivery_method: str, address: str = None, phone: str = None) -> int:
-    cart_items = get_cart(user_id)
-    if not cart_items:
+def create_order(buyer_id: int, cart_items: List[Dict], delivery_method: str, address: str = None, phone: str = None) -> Optional[int]:
+    try:
+        total = sum(item["quantity"] * item["products"]["price"] for item in cart_items)
+        order_number = f"PALIZ-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+        
+        items_json = [{
+            "product_id": item["product_id"],
+            "name": item["products"]["name"],
+            "quantity": item["quantity"],
+            "price": item["products"]["price"]
+        } for item in cart_items]
+        
+        order_data = {
+            "order_number": order_number,
+            "buyer_id": buyer_id,
+            "seller_id": cart_items[0]["products"].get("seller_user_id") if cart_items else None,
+            "seller_type": cart_items[0]["products"].get("seller_type") if cart_items else "farmer",
+            "items": items_json,
+            "total_amount": total + (5000 if delivery_method == "delivery" else 0),
+            "delivery_method": delivery_method,
+            "delivery_address": address,
+            "delivery_phone": phone,
+            "delivery_fee": 5000 if delivery_method == "delivery" else 0,
+            "status": "pending",
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase.table("orders").insert(order_data).execute()
+        
+        if result.data:
+            clear_cart(buyer_id)
+            return result.data[0]["id"]
         return None
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        order_ids = []
-        for item in cart_items:
-            product_id, name, price, quantity, total, unit, f_id = item
-            cursor.execute('''
-                INSERT INTO orders (user_id, farmer_id, product_id, quantity, total_price, delivery_method, address, phone)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, farmer_id, product_id, quantity, total, delivery_method, address, phone))
-            order_ids.append(cursor.lastrowid)
-        cursor.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
-        conn.commit()
-        return order_ids[0] if order_ids else None
-
-def update_order_status(order_id: int, status: str):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
-        conn.commit()
+    except Exception as e:
+        logging.error(f"create_order error: {e}")
+        return None
 
 def get_user_orders(user_id: int) -> List[Dict]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT o.id, p.name, p.unit, o.quantity, o.total_price, o.status, o.created_at, o.delivery_method
-            FROM orders o
-            JOIN products p ON o.product_id = p.id
-            WHERE o.user_id = ?
-            ORDER BY o.created_at DESC
-        ''', (user_id,))
-        rows = cursor.fetchall()
-        return [{
-            'id': row[0], 'product_name': row[1], 'unit': row[2], 'quantity': row[3],
-            'total_price': row[4], 'status': row[5], 'created_at': row[6], 'delivery_method': row[7]
-        } for row in rows]
+    try:
+        result = supabase.table("orders").select("*").eq("buyer_id", user_id).order("created_at", desc=True).execute()
+        return result.data
+    except Exception as e:
+        logging.error(f"get_user_orders error: {e}")
+        return []
 
-def add_user(user_id: int, username: str = None, full_name: str = None):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)', 
-                      (user_id, username, full_name))
-        conn.commit()
+def check_admin_password(password: str) -> bool:
+    try:
+        result = supabase.table("settings").select("value").eq("key", "admin_password").execute()
+        if result.data:
+            return result.data[0]["value"] == password
+        return password == "Paliz20030303m"
+    except Exception as e:
+        logging.error(f"check_admin_password error: {e}")
+        return password == "Paliz20030303m"
 
-def get_user(user_id: int) -> Optional[Dict]:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if row:
-            return {'user_id': row[0], 'username': row[1], 'full_name': row[2], 
-                    'phone': row[3], 'role': row[4], 'registered_at': row[5]}
-        return None
+def set_admin_role(telegram_id: int) -> bool:
+    return update_user_role(telegram_id, "admin")
 
 # ==================== КЛАВИАТУРЫ ====================
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton(text="🛒 Каталог")],
-        [KeyboardButton(text="🛍️ Корзина"), KeyboardButton(text="📦 Мои заказы")],
-        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
-    ]
+def get_main_keyboard(role: str = "buyer") -> ReplyKeyboardMarkup:
+    if role == "farmer":
+        buttons = [
+            [KeyboardButton(text="📦 Мои заказы")],
+            [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="📋 Мои товары")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
+        ]
+    elif role == "gardener":
+        buttons = [
+            [KeyboardButton(text="📦 Мои заказы")],
+            [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="📋 Мои товары")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
+        ]
+    elif role == "delivery":
+        buttons = [
+            [KeyboardButton(text="🚚 Заказы на доставку")],
+            [KeyboardButton(text="✅ Мои доставки")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
+        ]
+    elif role == "manager":
+        buttons = [
+            [KeyboardButton(text="🌾 Заявки фермеров"), KeyboardButton(text="🚚 Заявки доставщиков")],
+            [KeyboardButton(text="📦 Все заказы")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
+        ]
+    elif role == "admin":
+        buttons = [
+            [KeyboardButton(text="⚙️ Админ панель")],
+            [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="📦 Заказы")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
+        ]
+    else:
+        buttons = [
+            [KeyboardButton(text="🛒 Каталог")],
+            [KeyboardButton(text="🛍️ Корзина"), KeyboardButton(text="📦 Мои заказы")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")]
+        ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_role_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛒 ПОКУПАТЕЛЬ", callback_data="role_buyer")
+    builder.button(text="🏠 САДОВОД (частник)", callback_data="role_gardener")
+    builder.button(text="🌾 ФЕРМЕР (с проверкой)", callback_data="role_farmer")
+    builder.button(text="🚚 ДОСТАВЩИК (с проверкой)", callback_data="role_delivery")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_location_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def get_farmer_requests_keyboard(requests: List[Dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for req in requests:
+        builder.button(text=f"🌾 {req['farm_name'][:25]}", callback_data=f"fr_{req['id']}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_delivery_requests_keyboard(requests: List[Dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for req in requests:
+        builder.button(text=f"🚚 {req['full_name'][:25]}", callback_data=f"dr_{req['id']}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_request_action_keyboard(request_id: int, request_type: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Одобрить", callback_data=f"approve_{request_type}_{request_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"reject_{request_type}_{request_id}")
+    builder.adjust(2)
+    return builder.as_markup()
 
 def get_categories_keyboard(categories: List[Dict]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for cat in categories:
-        builder.button(text=cat['name'], callback_data=f"cat_{cat['id']}")
-    builder.adjust(1)
+        builder.button(text=f"{cat.get('icon', '📦')} {cat['name']}", callback_data=f"cat_{cat['id']}")
+    builder.adjust(2)
     return builder.as_markup()
 
-def get_products_keyboard(products: List[Dict], page: int = 0, items_per_page: int = 5) -> InlineKeyboardMarkup:
+def get_products_with_sellers_keyboard(products: List[Dict], page: int = 0, items_per_page: int = 5, user_lat: float = None, user_lon: float = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     start = page * items_per_page
     end = start + items_per_page
+    
     for product in products[start:end]:
-        builder.button(text=f"{product['name']} — {product['price']} сум / {product['unit']}", 
-                      callback_data=f"product_{product['id']}")
+        text = f"{product['name']} — {product['price']}₽ / {product['unit']}"
+        
+        if product['seller_type'] == 'farmer':
+            text = f"🌾 {text}"
+        else:
+            text = f"🏠 {text}"
+        
+        if user_lat and user_lon and product.get('seller_lat') and product.get('seller_lon'):
+            dist = calculate_distance(user_lat, user_lon, product['seller_lat'], product['seller_lon'])
+            if dist != float('inf'):
+                text = f"{text} 📍{dist}км"
+        
+        builder.button(text=text[:60], callback_data=f"product_{product['id']}")
+    
     builder.adjust(1)
-    nav_buttons = []
+    
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"page_{page-1}"))
+        builder.button(text="◀️ Назад", callback_data=f"products_page_{page-1}")
     if end < len(products):
-        nav_buttons.append(InlineKeyboardButton(text="Вперед ▶️", callback_data=f"page_{page+1}"))
-    if nav_buttons:
-        builder.row(*nav_buttons)
-    builder.row(InlineKeyboardButton(text="🔙 Назад к категориям", callback_data="back_to_categories"))
+        builder.button(text="Вперед ▶️", callback_data=f"products_page_{page+1}")
+    
+    builder.button(text="📊 Сортировка", callback_data="sort_menu")
+    builder.button(text="🔙 Назад к категориям", callback_data="back_to_categories")
+    
     return builder.as_markup()
 
-def get_product_detail_keyboard(product_id: int, in_cart: bool = False) -> InlineKeyboardMarkup:
+def get_sort_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    if in_cart:
-        builder.button(text="✅ В корзине", callback_data="already_in_cart")
-    else:
-        builder.button(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_id}")
-    builder.button(text="🔙 Назад", callback_data="back_to_products")
-    builder.button(text="📍 Показать на карте", callback_data=f"show_map_{product_id}")
+    builder.button(text="💰 По цене (возрастание)", callback_data="sort_price_asc")
+    builder.button(text="💰 По цене (убывание)", callback_data="sort_price_desc")
+    builder.button(text="📍 По расстоянию (ближе)", callback_data="sort_distance_asc")
+    builder.button(text="🌾 Фермеры сначала", callback_data="sort_farmer_first")
+    builder.button(text="🏠 Садоводы сначала", callback_data="sort_gardener_first")
+    builder.button(text="📛 По названию", callback_data="sort_name")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -394,8 +538,8 @@ def get_cart_keyboard() -> InlineKeyboardMarkup:
 
 def get_delivery_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="📍 Самовывоз (бесплатно)", callback_data="pickup")
-    builder.button(text="🚛 Доставка (5000 сум)", callback_data="delivery")
+    builder.button(text="📍 Самовывоз (бесплатно)", callback_data="delivery_pickup")
+    builder.button(text="🚛 Доставка (5000₽)", callback_data="delivery_courier")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -406,51 +550,36 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
     builder.adjust(2)
     return builder.as_markup()
 
-def get_pickup_confirmation_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить самовывоз", callback_data="confirm_pickup")
-    builder.button(text="❌ Отмена", callback_data="cancel_order")
-    builder.adjust(2)
-    return builder.as_markup()
+# ==================== СОСТОЯНИЯ ====================
 
-def get_quantity_keyboard(product_id: int, unit: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    if unit == 'кг':
-        builder.button(text="0.5 кг", callback_data=f"qty_{product_id}_0.5")
-        builder.button(text="1 кг", callback_data=f"qty_{product_id}_1")
-        builder.button(text="2 кг", callback_data=f"qty_{product_id}_2")
-        builder.button(text="3 кг", callback_data=f"qty_{product_id}_3")
-        builder.button(text="5 кг", callback_data=f"qty_{product_id}_5")
-    elif unit == 'пучок':
-        builder.button(text="1 пучок", callback_data=f"qty_{product_id}_1")
-        builder.button(text="2 пучка", callback_data=f"qty_{product_id}_2")
-        builder.button(text="3 пучка", callback_data=f"qty_{product_id}_3")
-        builder.button(text="5 пучков", callback_data=f"qty_{product_id}_5")
-    elif unit == 'литр':
-        builder.button(text="1 л", callback_data=f"qty_{product_id}_1")
-        builder.button(text="2 л", callback_data=f"qty_{product_id}_2")
-        builder.button(text="3 л", callback_data=f"qty_{product_id}_3")
-    else:
-        builder.button(text="1 шт", callback_data=f"qty_{product_id}_1")
-        builder.button(text="2 шт", callback_data=f"qty_{product_id}_2")
-        builder.button(text="3 шт", callback_data=f"qty_{product_id}_3")
-        builder.button(text="5 шт", callback_data=f"qty_{product_id}_5")
-    
-    builder.button(text="✏️ Своё значение", callback_data=f"custom_qty_{product_id}")
-    builder.button(text="🔙 Назад", callback_data=f"back_to_product_{product_id}")
-    builder.adjust(2)
-    return builder.as_markup()
-
-# ==================== СОСТОЯНИЯ (FSM) ====================
+class RegistrationStates(StatesGroup):
+    waiting_for_role = State()
+    waiting_for_farmer_name = State()
+    waiting_for_farmer_address = State()
+    waiting_for_farmer_phone = State()
+    waiting_for_farmer_location = State()
+    waiting_for_gardener_name = State()
+    waiting_for_gardener_address = State()
+    waiting_for_gardener_phone = State()
+    waiting_for_gardener_location = State()
+    waiting_for_delivery_name = State()
+    waiting_for_delivery_phone = State()
+    waiting_for_delivery_vehicle = State()
+    waiting_for_delivery_location = State()
+    waiting_for_admin_password = State()
 
 class OrderStates(StatesGroup):
     waiting_for_delivery_method = State()
     waiting_for_address = State()
     waiting_for_phone = State()
-    waiting_for_confirmation = State()
 
 class AddToCartStates(StatesGroup):
-    waiting_for_custom_quantity = State()
+    waiting_for_quantity = State()
+
+class CatalogStates(StatesGroup):
+    products = State()
+    current_page = State()
+    sort_type = State()
 
 # ==================== ОБРАБОТЧИКИ ====================
 
@@ -458,102 +587,419 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+async def send_notification_to_managers(message_text: str):
+    managers = get_all_managers()
+    for manager in managers:
+        try:
+            await bot.send_message(manager["user_id"], message_text, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка уведомления: {e}")
+
+async def show_main_menu(message: Message, user: Dict):
+    role = user.get("role", "buyer")
+    role_names = {
+        'buyer': '🛒 Покупатель',
+        'gardener': '🏠 Садовод',
+        'farmer': '🌾 Фермер',
+        'delivery': '🚚 Доставщик',
+        'manager': '👤 Менеджер',
+        'admin': '⚙️ Администратор'
+    }
+    welcome = f"👋 Добро пожаловать, {user.get('full_name', user.get('username', 'Пользователь'))}!\n\nВаша роль: {role_names.get(role, role)}"
+    await message.answer(welcome, reply_markup=get_main_keyboard(role), parse_mode="Markdown")
+
+# ---------- /start ----------
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    full_name = message.from_user.full_name
-    add_user(user_id, username, full_name)
+async def cmd_start(message: Message, state: FSMContext):
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        await state.set_state(RegistrationStates.waiting_for_role)
+        await message.answer(
+            "🌾 *Paliz Marketga xush kelibsiz!*\n\nKim bo'lib ro'yxatdan o'tmoqchisiz?",
+            reply_markup=get_role_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        await show_main_menu(message, user)
+
+# ---------- /admin ----------
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    await state.set_state(RegistrationStates.waiting_for_admin_password)
+    await message.answer("🔐 *Введите пароль для входа в админ-панель:*", parse_mode="Markdown")
+
+@dp.message(RegistrationStates.waiting_for_admin_password)
+async def process_admin_password(message: Message, state: FSMContext):
+    if check_admin_password(message.text):
+        set_admin_role(message.from_user.id)
+        await message.answer("✅ *Вы стали администратором!*", parse_mode="Markdown")
+        user = get_user_by_telegram_id(message.from_user.id)
+        await show_main_menu(message, user)
+    else:
+        await message.answer("❌ *Неверный пароль!*", parse_mode="Markdown")
+    await state.clear()
+
+# ---------- Выбор роли ----------
+@dp.callback_query(RegistrationStates.waiting_for_role)
+async def process_role_selection(callback: CallbackQuery, state: FSMContext):
+    role = callback.data.split("_")[1]
+    
+    if role == "buyer":
+        add_user(callback.from_user.id, callback.from_user.username, callback.from_user.full_name, "buyer")
+        user = get_user_by_telegram_id(callback.from_user.id)
+        await callback.message.edit_text("✅ Вы зарегистрированы как Покупатель!")
+        await show_main_menu(callback.message, user)
+        await callback.answer()
+        await state.clear()
+        
+    elif role == "gardener":
+        await state.update_data(role="gardener")
+        await state.set_state(RegistrationStates.waiting_for_gardener_name)
+        await callback.message.edit_text("🏠 *Регистрация садовода*\n\nВведите название вашего сада:", parse_mode="Markdown")
+        await callback.answer()
+        
+    elif role == "farmer":
+        await state.update_data(role="farmer")
+        await state.set_state(RegistrationStates.waiting_for_farmer_name)
+        await callback.message.edit_text("🌾 *Регистрация фермера*\n\nВведите название хозяйства:", parse_mode="Markdown")
+        await callback.answer()
+        
+    elif role == "delivery":
+        await state.update_data(role="delivery")
+        await state.set_state(RegistrationStates.waiting_for_delivery_name)
+        await callback.message.edit_text("🚚 *Регистрация доставщика*\n\nВведите ваше ФИО:", parse_mode="Markdown")
+        await callback.answer()
+
+# ---------- Садовод (с геолокацией) ----------
+@dp.message(RegistrationStates.waiting_for_gardener_name)
+async def process_gardener_name(message: Message, state: FSMContext):
+    await state.update_data(garden_name=message.text)
+    await state.set_state(RegistrationStates.waiting_for_gardener_address)
+    await message.answer("🏠 Введите адрес вашего сада/огорода:")
+
+@dp.message(RegistrationStates.waiting_for_gardener_address)
+async def process_gardener_address(message: Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await state.set_state(RegistrationStates.waiting_for_gardener_phone)
+    await message.answer("📞 Введите номер телефона для связи:")
+
+@dp.message(RegistrationStates.waiting_for_gardener_phone)
+async def process_gardener_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(RegistrationStates.waiting_for_gardener_location)
     await message.answer(
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        "Добро пожаловать в **Paliz Market** — ваш гид в мире свежих продуктов от местных фермеров!\n\n"
-        "🛒 Выбирайте товары в каталоге, оформляйте заказы и получайте их с доставкой или самовывозом.\n\n"
-        "Хороших вам покупок!",
-        reply_markup=get_main_keyboard(),
+        "📍 *Отправьте геолокацию вашего сада/огорода*\n\n"
+        "Нажмите на кнопку ниже и отправьте местоположение на карте.\n\n"
+        "Это нужно, чтобы покупатели видели расстояние до вас.",
+        reply_markup=get_location_keyboard(),
         parse_mode="Markdown"
     )
 
-@dp.message(Command("help"))
-@dp.message(F.text == "❓ Помощь")
-async def cmd_help(message: Message):
+@dp.message(RegistrationStates.waiting_for_gardener_location, F.location)
+async def process_gardener_location(message: Message, state: FSMContext):
+    data = await state.get_data()
+    latitude = message.location.latitude
+    longitude = message.location.longitude
+    
+    add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "gardener")
+    add_gardener(message.from_user.id, data['garden_name'], data['address'], data['phone'], latitude, longitude)
+    
     await message.answer(
-        "❓ *Как пользоваться ботом?*\n\n"
-        "• 🛒 *Каталог* — просмотр и выбор товаров\n"
-        "• 🛍️ *Корзина* — оформление заказа\n"
-        "• 📦 *Мои заказы* — история покупок\n"
-        "• 👤 *Профиль* — ваши данные\n\n"
-        "📍 *Самовывоз*: Фермерское хозяйство Paliz, г. Нукус, ул. Каракалпакская 15\n"
-        "🚛 *Доставка*: 5000 сум по городу\n\n"
-        "По всем вопросам: @paliz_support",
+        "✅ *Вы успешно зарегистрированы как Садовод!*\n\n"
+        "📍 Ваша геолокация сохранена. Теперь покупатели могут видеть расстояние до вас.\n\n"
+        "➕ Используйте кнопку 'Добавить товар', чтобы начать продавать.",
+        reply_markup=get_main_keyboard("gardener"),
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+# ---------- Фермер (заявка с геолокацией) ----------
+@dp.message(RegistrationStates.waiting_for_farmer_name)
+async def process_farmer_name(message: Message, state: FSMContext):
+    await state.update_data(farm_name=message.text)
+    await state.set_state(RegistrationStates.waiting_for_farmer_address)
+    await message.answer("🌾 Введите адрес вашего хозяйства:")
+
+@dp.message(RegistrationStates.waiting_for_farmer_address)
+async def process_farmer_address(message: Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await state.set_state(RegistrationStates.waiting_for_farmer_phone)
+    await message.answer("📞 Введите номер телефона для связи:")
+
+@dp.message(RegistrationStates.waiting_for_farmer_phone)
+async def process_farmer_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(RegistrationStates.waiting_for_farmer_location)
+    await message.answer(
+        "📍 *Отправьте геолокацию вашего хозяйства*\n\n"
+        "Нажмите на кнопку ниже и отправьте местоположение на карте.\n\n"
+        "Это нужно для отображения расстояния до покупателей.",
+        reply_markup=get_location_keyboard(),
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "🛒 Каталог")
-async def show_catalog(message: Message):
-    categories = get_all_categories()
-    if not categories:
-        await message.answer("📭 Каталог пока пуст. Загляните позже!")
+@dp.message(RegistrationStates.waiting_for_farmer_location, F.location)
+async def process_farmer_location(message: Message, state: FSMContext):
+    data = await state.get_data()
+    latitude = message.location.latitude
+    longitude = message.location.longitude
+    
+    add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "buyer")
+    add_farmer_request(message.from_user.id, data['farm_name'], data['address'], data['phone'], latitude, longitude)
+    
+    await message.answer(
+        "✅ *Заявка отправлена менеджеру!*\n\n"
+        "📍 Ваша геолокация сохранена в заявке.\n\n"
+        "После одобрения вы сможете добавлять товары.",
+        reply_markup=get_main_keyboard("buyer"),
+        parse_mode="Markdown"
+    )
+    
+    await send_notification_to_managers(
+        f"🔔 *Новая заявка фермера!*\n\n"
+        f"👤 Пользователь: @{message.from_user.username}\n"
+        f"🏠 Хозяйство: {data['farm_name']}\n"
+        f"📍 Адрес: {data['address']}\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"🗺️ Координаты: {latitude}, {longitude}"
+    )
+    await state.clear()
+
+# ---------- Доставщик (заявка с геолокацией) ----------
+@dp.message(RegistrationStates.waiting_for_delivery_name)
+async def process_delivery_name(message: Message, state: FSMContext):
+    await state.update_data(full_name=message.text)
+    await state.set_state(RegistrationStates.waiting_for_delivery_phone)
+    await message.answer("📞 Введите номер телефона:")
+
+@dp.message(RegistrationStates.waiting_for_delivery_phone)
+async def process_delivery_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(RegistrationStates.waiting_for_delivery_vehicle)
+    await message.answer("🚗 Вид транспорта (машина/мотобайк/велосипед):")
+
+@dp.message(RegistrationStates.waiting_for_delivery_vehicle)
+async def process_delivery_vehicle(message: Message, state: FSMContext):
+    await state.update_data(vehicle_type=message.text)
+    await state.set_state(RegistrationStates.waiting_for_delivery_location)
+    await message.answer(
+        "📍 *Отправьте вашу текущую геолокацию*\n\n"
+        "Это нужно для распределения заказов поблизости.",
+        reply_markup=get_location_keyboard(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(RegistrationStates.waiting_for_delivery_location, F.location)
+async def process_delivery_location(message: Message, state: FSMContext):
+    data = await state.get_data()
+    latitude = message.location.latitude
+    longitude = message.location.longitude
+    
+    add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "buyer")
+    add_delivery_request(message.from_user.id, data['full_name'], data['phone'], data['vehicle_type'], latitude, longitude)
+    
+    await message.answer(
+        "✅ *Заявка отправлена менеджеру!*\n\n"
+        "После одобрения вы сможете принимать заказы на доставку.",
+        reply_markup=get_main_keyboard("buyer"),
+        parse_mode="Markdown"
+    )
+    
+    await send_notification_to_managers(
+        f"🔔 *Новая заявка доставщика!*\n\n"
+        f"👤 Пользователь: @{message.from_user.username}\n"
+        f"📝 ФИО: {data['full_name']}\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"🚗 Транспорт: {data['vehicle_type']}\n"
+        f"🗺️ Координаты: {latitude}, {longitude}"
+    )
+    await state.clear()
+
+# ---------- Менеджер: заявки ----------
+@dp.message(F.text == "🌾 Заявки фермеров")
+async def show_farmer_requests(message: Message):
+    user = get_user_by_telegram_id(message.from_user.id)
+    if user.get("role") not in ["manager", "admin"]:
+        await message.answer("⛔ Нет доступа.")
         return
-    await message.answer("📋 *Выберите категорию товаров:*", 
-                        reply_markup=get_categories_keyboard(categories), 
-                        parse_mode="Markdown")
+    requests = get_pending_farmer_requests()
+    if not requests:
+        await message.answer("📭 Нет заявок.")
+        return
+    await message.answer(f"📋 Заявки фермеров ({len(requests)}):", reply_markup=get_farmer_requests_keyboard(requests))
+
+@dp.message(F.text == "🚚 Заявки доставщиков")
+async def show_delivery_requests(message: Message):
+    user = get_user_by_telegram_id(message.from_user.id)
+    if user.get("role") not in ["manager", "admin"]:
+        await message.answer("⛔ Нет доступа.")
+        return
+    requests = get_pending_delivery_requests()
+    if not requests:
+        await message.answer("📭 Нет заявок.")
+        return
+    await message.answer(f"📋 Заявки доставщиков ({len(requests)}):", reply_markup=get_delivery_requests_keyboard(requests))
+
+@dp.callback_query(F.data.startswith("fr_"))
+async def view_farmer_request(callback: CallbackQuery):
+    request_id = int(callback.data.split("_")[1])
+    req = next((r for r in get_pending_farmer_requests() if r["id"] == request_id), None)
+    if not req:
+        await callback.message.edit_text("❌ Заявка не найдена.")
+        await callback.answer()
+        return
+    text = f"🌾 *Заявка #{req['id']}*\n🏠 {req['farm_name']}\n📍 {req['address']}\n📞 {req['phone']}\n🗺️ Координаты: {req.get('latitude', 'нет')}, {req.get('longitude', 'нет')}"
+    await callback.message.edit_text(text, reply_markup=get_request_action_keyboard(request_id, "farmer"))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("dr_"))
+async def view_delivery_request(callback: CallbackQuery):
+    request_id = int(callback.data.split("_")[1])
+    req = next((r for r in get_pending_delivery_requests() if r["id"] == request_id), None)
+    if not req:
+        await callback.message.edit_text("❌ Заявка не найдена.")
+        await callback.answer()
+        return
+    text = f"🚚 *Заявка #{req['id']}*\n👤 {req['full_name']}\n📞 {req['phone']}\n🚗 {req['vehicle_type']}\n🗺️ Координаты: {req.get('latitude', 'нет')}, {req.get('longitude', 'нет')}"
+    await callback.message.edit_text(text, reply_markup=get_request_action_keyboard(request_id, "delivery"))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def approve_request(callback: CallbackQuery):
+    _, req_type, req_id = callback.data.split("_")
+    req_id = int(req_id)
+    
+    if req_type == "farmer":
+        req = next((r for r in get_pending_farmer_requests() if r["id"] == req_id), None)
+        if req:
+            approve_farmer_request(req_id, req["user_id"], req["farm_name"], req.get("address", ""), req.get("phone", ""), req.get("latitude"), req.get("longitude"))
+            await callback.message.edit_text("✅ Заявка фермера одобрена!")
+            try:
+                await bot.send_message(req["user_id"], "🌾 *Ваша заявка одобрена! Теперь вы фермер.*", parse_mode="Markdown")
+            except: pass
+    elif req_type == "delivery":
+        req = next((r for r in get_pending_delivery_requests() if r["id"] == req_id), None)
+        if req:
+            approve_delivery_request(req_id, req["user_id"], req["full_name"], req["phone"], req["vehicle_type"], req.get("latitude"), req.get("longitude"))
+            await callback.message.edit_text("✅ Заявка доставщика одобрена!")
+            try:
+                await bot.send_message(req["user_id"], "🚚 *Ваша заявка одобрена! Теперь вы доставщик.*", parse_mode="Markdown")
+            except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_request_cmd(callback: CallbackQuery):
+    _, req_type, req_id = callback.data.split("_")
+    req_id = int(req_id)
+    reject_request(f"{req_type}_requests", req_id)
+    await callback.message.edit_text("❌ Заявка отклонена.")
+    await callback.answer()
+
+# ---------- Каталог ----------
+@dp.message(F.text == "🛒 Каталог")
+async def show_catalog_location_request(message: Message):
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Поделиться геолокацией", request_location=True)]],
+        resize_keyboard=True
+    )
+    await message.answer(
+        "📍 *Для показа ближайших продавцов*, поделитесь геолокацией.\nИли нажмите 'Пропустить'.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.location)
+async def handle_location(message: Message, state: FSMContext):
+    user_location_cache[message.from_user.id] = {"lat": message.location.latitude, "lon": message.location.longitude}
+    categories = get_categories()
+    await message.answer("📋 *Выберите категорию:*", reply_markup=get_categories_keyboard(categories), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("cat_"))
-async def show_products(callback: CallbackQuery):
+async def show_products_by_category(callback: CallbackQuery, state: FSMContext):
     category_id = int(callback.data.split("_")[1])
     products = get_products_by_category(category_id)
     if not products:
-        await callback.message.edit_text("📭 В этой категории пока нет товаров.")
+        await callback.message.edit_text("📭 Товаров нет.")
         await callback.answer()
         return
-    await callback.message.edit_text("📋 *Список товаров:*", 
-                                    reply_markup=get_products_keyboard(products, 0), 
-                                    parse_mode="Markdown")
+    
+    products.sort(key=lambda x: (0 if x['seller_type'] == 'farmer' else 1, x['price']))
+    
+    await state.update_data(products=products, current_page=0, sort_type="default")
+    
+    loc = user_location_cache.get(callback.from_user.id)
+    await callback.message.edit_text(
+        "📋 *Список товаров:*\n🌾 — фермер, 🏠 — садовод, 📍 — расстояние",
+        reply_markup=get_products_with_sellers_keyboard(products, 0, 5, loc.get("lat") if loc else None, loc.get("lon") if loc else None),
+        parse_mode="Markdown"
+    )
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("page_"))
-async def paginate_products(callback: CallbackQuery):
-    page = int(callback.data.split("_")[1])
-    categories = get_all_categories()
-    if categories:
-        products = get_products_by_category(categories[0]['id'])
-        await callback.message.edit_reply_markup(reply_markup=get_products_keyboard(products, page))
+@dp.callback_query(F.data.startswith("products_page_"))
+async def paginate_products(callback: CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[2])
+    data = await state.get_data()
+    products = data.get("products", [])
+    loc = user_location_cache.get(callback.from_user.id)
+    await callback.message.edit_reply_markup(
+        reply_markup=get_products_with_sellers_keyboard(products, page, 5, loc.get("lat") if loc else None, loc.get("lon") if loc else None)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "sort_menu")
+async def show_sort_menu(callback: CallbackQuery):
+    await callback.message.edit_text("📊 *Сортировка:*", reply_markup=get_sort_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sort_"))
+async def apply_sort(callback: CallbackQuery, state: FSMContext):
+    sort_type = callback.data.split("_")[1]
+    data = await state.get_data()
+    products = data.get("products", []).copy()
+    loc = user_location_cache.get(callback.from_user.id)
+    
+    if sort_type == "price_asc":
+        products.sort(key=lambda x: x['price'])
+        sort_name = "По цене ↑"
+    elif sort_type == "price_desc":
+        products.sort(key=lambda x: x['price'], reverse=True)
+        sort_name = "По цене ↓"
+    elif sort_type == "distance_asc":
+        if loc:
+            for p in products:
+                if p.get('seller_lat') and p.get('seller_lon'):
+                    p['distance'] = calculate_distance(loc['lat'], loc['lon'], p['seller_lat'], p['seller_lon'])
+                else:
+                    p['distance'] = float('inf')
+            products.sort(key=lambda x: x.get('distance', float('inf')))
+            sort_name = "По расстоянию"
+        else:
+            await callback.answer("Поделитесь геолокацией!", show_alert=True)
+            return
+    elif sort_type == "farmer_first":
+        products.sort(key=lambda x: (0 if x['seller_type'] == 'farmer' else 1, x['price']))
+        sort_name = "Фермеры сначала"
+    elif sort_type == "gardener_first":
+        products.sort(key=lambda x: (0 if x['seller_type'] == 'gardener' else 1, x['price']))
+        sort_name = "Садоводы сначала"
+    elif sort_type == "name":
+        products.sort(key=lambda x: x['name'])
+        sort_name = "По названию"
+    else:
+        return
+    
+    await state.update_data(products=products, current_page=0, sort_type=sort_type)
+    await callback.message.edit_text(
+        f"📋 *Список товаров* (сортировка: {sort_name})",
+        reply_markup=get_products_with_sellers_keyboard(products, 0, 5, loc.get("lat") if loc else None, loc.get("lon") if loc else None),
+        parse_mode="Markdown"
+    )
     await callback.answer()
 
 @dp.callback_query(F.data == "back_to_categories")
 async def back_to_categories(callback: CallbackQuery):
-    categories = get_all_categories()
-    await callback.message.edit_text("📋 *Выберите категорию товаров:*", 
-                                    reply_markup=get_categories_keyboard(categories), 
-                                    parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "back_to_products")
-async def back_to_products(callback: CallbackQuery):
-    categories = get_all_categories()
-    if categories:
-        products = get_products_by_category(categories[0]['id'])
-        await callback.message.edit_text("📋 *Список товаров:*", 
-                                        reply_markup=get_products_keyboard(products, 0), 
-                                        parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "back_to_catalog")
-async def back_to_catalog(callback: CallbackQuery):
-    categories = get_all_categories()
-    await callback.message.edit_text("📋 *Выберите категорию товаров:*", 
-                                    reply_markup=get_categories_keyboard(categories), 
-                                    parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("back_to_product_"))
-async def back_to_product(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[3])
-    product = get_product_by_id(product_id)
-    if product:
-        in_cart = is_in_cart(callback.from_user.id, product_id)
-        text = f"🍅 *{product['name']}*\n\n💰 Цена: {product['price']} сум / {product['unit']}\n📦 В наличии: {product['stock']} {product['unit']}\n🌾 Продавец: {product['farm_name']}\n📍 {product['address']}\n\n📝 {product['description'] or 'Описание отсутствует'}"
-        await callback.message.edit_text(text, reply_markup=get_product_detail_keyboard(product_id, in_cart), parse_mode="Markdown")
+    categories = get_categories()
+    await callback.message.edit_text("📋 *Выберите категорию:*", reply_markup=get_categories_keyboard(categories), parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("product_"))
@@ -564,378 +1010,210 @@ async def show_product_detail(callback: CallbackQuery):
         await callback.message.edit_text("❌ Товар не найден.")
         await callback.answer()
         return
-    in_cart = is_in_cart(callback.from_user.id, product_id)
-    text = (f"🍅 *{product['name']}*\n\n"
-            f"💰 Цена: {product['price']} сум / {product['unit']}\n"
-            f"📦 В наличии: {product['stock']} {product['unit']}\n"
-            f"🌾 Продавец: {product['farm_name']}\n"
-            f"📍 Адрес: {product['address']}\n\n"
-            f"📝 {product['description'] or 'Описание отсутствует'}")
-    await callback.message.edit_text(text, reply_markup=get_product_detail_keyboard(product_id, in_cart), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("show_map_"))
-async def show_map(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[2])
-    product = get_product_by_id(product_id)
-    if product and product['latitude'] and product['longitude']:
-        await callback.message.answer_location(latitude=product['latitude'], longitude=product['longitude'])
-        await callback.message.answer(f"📍 {product['farm_name']}\n{product['address']}")
-    else:
-        await callback.message.answer("📍 Координаты не указаны. Адрес для самовывоза:\n" + (product['address'] if product else "Адрес не найден"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("add_to_cart_"))
-async def add_to_cart_start(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[3])
-    product = get_product_by_id(product_id)
-    if not product:
-        await callback.answer("Товар не найден!", show_alert=True)
-        return
     
+    loc = user_location_cache.get(callback.from_user.id)
+    text = f"🍅 *{product['name']}*\n💰 {product['price']}₽ / {product['unit']}\n📦 {product['stock']} {product['unit']}\n\n{product['badge']}\n🏪 *{product['seller_name']}*\n📍 {product['seller_address']}"
+    
+    if loc and product.get('seller_lat') and product.get('seller_lon'):
+        dist = calculate_distance(loc['lat'], loc['lon'], product['seller_lat'], product['seller_lon'])
+        if dist != float('inf'):
+            text += f"\n📏 Расстояние: {dist} км"
+    
+    text += f"\n📝 {product.get('description', 'Описание отсутствует')}"
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_id}")
+    builder.button(text="🔙 Назад", callback_data="back_to_products")
+    builder.adjust(1)
+    
+    if product.get('photo_id'):
+        await callback.message.delete()
+        await callback.message.answer_photo(photo=product['photo_id'], caption=text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    else:
+        await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_products")
+async def back_to_products(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    products = data.get("products", [])
+    loc = user_location_cache.get(callback.from_user.id)
     await callback.message.edit_text(
-        f"✏️ *Сколько {product['unit']} вы хотите купить?*\n\n"
-        f"Товар: {product['name']}\n"
-        f"Цена: {product['price']} сум / {product['unit']}\n"
-        f"Доступно: {product['stock']} {product['unit']}\n\n"
-        f"Выберите количество из предложенных или введите своё:",
-        reply_markup=get_quantity_keyboard(product_id, product['unit']),
+        "📋 *Список товаров:*",
+        reply_markup=get_products_with_sellers_keyboard(products, 0, 5, loc.get("lat") if loc else None, loc.get("lon") if loc else None),
         parse_mode="Markdown"
     )
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("qty_"))
-async def process_quantity_button(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    product_id = int(parts[1])
-    quantity = float(parts[2])
-    
-    product = get_product_by_id(product_id)
-    if product and quantity <= product['stock']:
-        add_to_cart(callback.from_user.id, product_id, product['farmer_id'], quantity)
-        await callback.message.edit_text(
-            f"✅ *Добавлено в корзину!*\n\n"
-            f"{quantity} {product['unit']} — {product['name']}\n"
-            f"Сумма: {int(product['price'] * quantity)} сум\n\n"
-            f"Можете продолжить покупки или перейти в корзину.",
-            reply_markup=get_main_keyboard(),
-            parse_mode="Markdown"
-        )
-    else:
-        await callback.message.edit_text(
-            f"❌ Извините, запрошенное количество ({quantity} {product['unit']}) превышает доступное ({product['stock']} {product['unit']}).",
-            reply_markup=get_quantity_keyboard(product_id, product['unit']),
-            parse_mode="Markdown"
-        )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("custom_qty_"))
-async def custom_quantity_start(callback: CallbackQuery, state: FSMContext):
-    product_id = int(callback.data.split("_")[2])
+@dp.callback_query(F.data.startswith("add_to_cart_"))
+async def add_to_cart_start(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split("_")[3])
     await state.update_data(product_id=product_id)
-    await state.set_state(AddToCartStates.waiting_for_custom_quantity)
-    await callback.message.answer(
-        "✏️ Введите нужное количество (например: 1.5, 2, 3):\n\n"
-        "Допускаются дробные числа (для кг и литров).",
-        reply_markup=types.ReplyKeyboardRemove()
-    )
+    await state.set_state(AddToCartStates.waiting_for_quantity)
+    await callback.message.answer("✏️ *Введите количество:*", parse_mode="Markdown")
     await callback.answer()
 
-@dp.message(AddToCartStates.waiting_for_custom_quantity)
-async def process_custom_quantity(message: Message, state: FSMContext):
+@dp.message(AddToCartStates.waiting_for_quantity)
+async def process_quantity(message: Message, state: FSMContext):
     try:
         quantity = float(message.text.replace(',', '.'))
         if quantity <= 0:
             raise ValueError
-        
         data = await state.get_data()
-        product_id = data['product_id']
-        product = get_product_by_id(product_id)
-        
-        if product and quantity <= product['stock']:
-            add_to_cart(message.from_user.id, product_id, product['farmer_id'], quantity)
-            await message.answer(
-                f"✅ *Добавлено в корзину!*\n\n"
-                f"{quantity} {product['unit']} — {product['name']}\n"
-                f"Сумма: {int(product['price'] * quantity)} сум\n\n"
-                f"Можете продолжить покупки или перейти в корзину.",
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        else:
-            await message.answer(
-                f"❌ Извините, запрошенное количество ({quantity} {product['unit']}) превышает доступное ({product['stock']} {product['unit']}).\n\n"
-                f"Попробуйте снова:",
-                reply_markup=get_main_keyboard()
-            )
+        add_to_cart(message.from_user.id, data['product_id'], quantity)
+        await message.answer(f"✅ *Добавлено {quantity} ед. в корзину!*", parse_mode="Markdown")
         await state.clear()
     except ValueError:
-        await message.answer("❌ Пожалуйста, введите корректное число (например: 1.5, 2, 3)")
+        await message.answer("❌ Введите корректное число.")
 
+# ---------- Корзина ----------
 @dp.message(F.text == "🛍️ Корзина")
 async def show_cart(message: Message):
-    user_id = message.from_user.id
-    cart_items = get_cart(user_id)
+    cart_items = get_cart(message.from_user.id)
     if not cart_items:
-        await message.answer("🛒 Ваша корзина пуста. Добавьте товары через каталог!")
+        await message.answer("🛒 Корзина пуста.")
         return
+    
     text = "🛒 *Ваша корзина:*\n\n"
     total = 0
     for item in cart_items:
-        product_id, name, price, quantity, item_total, unit, farmer_id = item
-        text += f"• {name} — {quantity} {unit} × {price} сум = {item_total} сум\n"
-        total += item_total
-    text += f"\n💵 *Итого: {total} сум*"
-    
-    farmers = set(item[6] for item in cart_items)
-    if len(farmers) > 1:
-        text += "\n\n⚠️ *Внимание!* В вашей корзине товары от разных фермеров. Придётся оформить несколько заказов."
-    
+        prod = item.get("products", {})
+        price = prod.get("price", 0)
+        qty = item.get("quantity", 0)
+        total += price * qty
+        text += f"• {prod.get('name', '?')} — {qty} × {price} = {price * qty}₽\n"
+    text += f"\n💵 *Итого: {total}₽*"
     await message.answer(text, reply_markup=get_cart_keyboard(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "clear_cart")
-async def clear_cart_handler(callback: CallbackQuery):
+async def clear_cart_cmd(callback: CallbackQuery):
     clear_cart(callback.from_user.id)
-    await callback.message.edit_text("🛒 Корзина очищена!")
+    await callback.message.edit_text("🗑️ Корзина очищена.")
     await callback.answer()
 
 @dp.callback_query(F.data == "checkout")
 async def start_checkout(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    cart_items = get_cart(user_id)
+    cart_items = get_cart(callback.from_user.id)
     if not cart_items:
-        await callback.answer("Ваша корзина пуста!", show_alert=True)
+        await callback.answer("Корзина пуста!", show_alert=True)
         return
-    
     await state.update_data(cart_items=cart_items)
     await state.set_state(OrderStates.waiting_for_delivery_method)
-    
-    await callback.message.answer(
-        "🚚 *Выберите способ получения заказа:*\n\n"
-        "📍 Самовывоз — бесплатно, вы забираете товар сами\n"
-        "🚛 Доставка — 5000 сум по городу",
-        reply_markup=get_delivery_keyboard(),
-        parse_mode="Markdown"
-    )
+    await callback.message.answer("🚚 *Выберите способ получения:*", reply_markup=get_delivery_keyboard(), parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(OrderStates.waiting_for_delivery_method)
 async def process_delivery_method(callback: CallbackQuery, state: FSMContext):
-    method = callback.data
+    method = "pickup" if callback.data == "delivery_pickup" else "delivery"
     await state.update_data(delivery_method=method)
-    
-    user_id = callback.from_user.id
-    farmer_id = get_cart_farmer_id(user_id)
-    farmer_info = get_farmer_info(farmer_id) if farmer_id else None
-    
-    if method == "pickup":
-        await state.update_data(address=farmer_info['address'] if farmer_info else "г. Нукус, ул. Каракалпакская 15")
-        
-        text = "📍 *Самовывоз*\n\n"
-        if farmer_info:
-            text += f"🏪 {farmer_info['farm_name']}\n"
-            text += f"📍 {farmer_info['address']}\n"
-            text += f"🕐 Часы работы: {farmer_info['work_hours']}\n"
-            text += f"📞 Телефон: {farmer_info['phone']}\n\n"
-        text += "✅ Подтвердите заказ, чтобы завершить оформление."
-        
-        await callback.message.answer(
-            text,
-            reply_markup=get_pickup_confirmation_keyboard(),
-            parse_mode="Markdown"
-        )
-        await state.set_state(OrderStates.waiting_for_confirmation)
-    else:
+    if method == "delivery":
         await state.set_state(OrderStates.waiting_for_address)
-        await callback.message.answer(
-            "🚚 *Доставка*\n\n"
-            "Пожалуйста, введите адрес доставки:",
-            parse_mode="Markdown"
-        )
+        await callback.message.answer("🚚 *Введите адрес доставки:*", parse_mode="Markdown")
+    else:
+        await state.set_state(OrderStates.waiting_for_phone)
+        await callback.message.answer("📞 *Введите номер телефона:*", parse_mode="Markdown")
     await callback.answer()
 
 @dp.message(OrderStates.waiting_for_address)
 async def process_address(message: Message, state: FSMContext):
     await state.update_data(address=message.text)
     await state.set_state(OrderStates.waiting_for_phone)
-    await message.answer("📞 Введите ваш номер телефона для связи:\n\nПример: +998 90 123 45 67")
+    await message.answer("📞 *Введите номер телефона:*", parse_mode="Markdown")
 
 @dp.message(OrderStates.waiting_for_phone)
 async def process_phone(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
     data = await state.get_data()
-    cart_items = data['cart_items']
-    address = data['address']
-    phone = data['phone']
-    delivery_method = data['delivery_method']
     
-    total = sum(item[4] for item in cart_items)
-    if delivery_method == "delivery":
-        total += 5000
-    
-    text = "📝 *Проверьте ваш заказ:*\n\n"
-    for item in cart_items:
-        product_id, name, price, quantity, item_total, unit, farmer_id = item
-        text += f"• {name} — {quantity} {unit} × {price} сум = {item_total} сум\n"
-    text += f"\n💵 *Итого: {total} сум*"
-    if delivery_method == "delivery":
-        text += "\n(включая доставку 5000 сум)"
-    text += f"\n\n🚚 Способ: {'Доставка' if delivery_method == 'delivery' else 'Самовывоз'}"
-    text += f"\n📍 Адрес: {address}"
-    text += f"\n📞 Телефон: {phone}"
-    text += "\n\n✅ Подтверждаете заказ?"
-    
-    farmer_id = get_cart_farmer_id(message.from_user.id)
-    await state.update_data(farmer_id=farmer_id, total=total)
-    
-    await message.answer(text, reply_markup=get_confirmation_keyboard(), parse_mode="Markdown")
-    await state.set_state(OrderStates.waiting_for_confirmation)
-
-@dp.callback_query(F.data == "confirm_pickup", OrderStates.waiting_for_confirmation)
-async def confirm_pickup_handler(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    cart_items = data['cart_items']
-    delivery_method = data.get('delivery_method', 'pickup')
-    address = data.get('address', 'Самовывоз')
-    phone = data.get('phone', callback.from_user.username or 'Не указан')
-    farmer_id = get_cart_farmer_id(callback.from_user.id)
-    total = sum(item[4] for item in cart_items)
-    
-    order_id = create_order(callback.from_user.id, farmer_id, delivery_method, address, phone)
+    order_id = create_order(
+        message.from_user.id,
+        data['cart_items'],
+        data['delivery_method'],
+        data.get('address'),
+        data['phone']
+    )
     
     if order_id:
-        for admin_id in ADMIN_IDS:
-            await callback.bot.send_message(
-                admin_id,
-                f"💰 *Новый заказ!*\n\n"
-                f"Номер: #{order_id}\n"
-                f"Пользователь: @{callback.from_user.username or callback.from_user.first_name}\n"
-                f"Сумма: {total} сум\n"
-                f"Способ: Самовывоз",
-                parse_mode="Markdown"
-            )
-        
-        farmer_info = get_farmer_info(farmer_id)
-        address_text = farmer_info['address'] if farmer_info else "г. Нукус, ул. Каракалпакская 15"
-        
-        await callback.message.edit_text(
-            f"✅ *Заказ подтверждён!*\n\n"
-            f"Номер заказа: #{order_id}\n"
-            f"Сумма: {total} сум\n\n"
-            f"📍 *Адрес самовывоза:*\n{address_text}\n\n"
-            f"🕐 Часы работы: {farmer_info['work_hours'] if farmer_info else '09:00 - 18:00'}\n\n"
-            f"Статус заказа можно отслеживать в разделе «Мои заказы».",
-            parse_mode="Markdown"
-        )
+        await message.answer(f"✅ *Заказ #{order_id} оформлен!*", parse_mode="Markdown")
     else:
-        await callback.message.edit_text("❌ Ошибка при создании заказа. Попробуйте снова.")
-    
+        await message.answer("❌ Ошибка при оформлении заказа.")
     await state.clear()
 
-@dp.callback_query(F.data == "confirm_order", OrderStates.waiting_for_confirmation)
-async def confirm_order_handler(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    cart_items = data['cart_items']
-    delivery_method = data.get('delivery_method', 'delivery')
-    address = data.get('address')
-    phone = data.get('phone')
-    farmer_id = get_cart_farmer_id(callback.from_user.id)
-    total = sum(item[4] for item in cart_items)
-    if delivery_method == "delivery":
-        total += 5000
-    
-    order_id = create_order(callback.from_user.id, farmer_id, delivery_method, address, phone)
-    
-    if order_id:
-        for admin_id in ADMIN_IDS:
-            await callback.bot.send_message(
-                admin_id,
-                f"💰 *Новый заказ!*\n\n"
-                f"Номер: #{order_id}\n"
-                f"Пользователь: @{callback.from_user.username or callback.from_user.first_name}\n"
-                f"Сумма: {total} сум\n"
-                f"Способ: Доставка\n"
-                f"Адрес: {address}\n"
-                f"Телефон: {phone}",
-                parse_mode="Markdown"
-            )
-        
-        await callback.message.edit_text(
-            f"✅ *Заказ подтверждён!*\n\n"
-            f"Номер заказа: #{order_id}\n"
-            f"Сумма: {total} сум\n\n"
-            f"Статус заказа можно отслеживать в разделе «Мои заказы».\n\n"
-            f"Доставка будет осуществлена в ближайшее время.",
-            parse_mode="Markdown"
-        )
-    else:
-        await callback.message.edit_text("❌ Ошибка при создании заказа. Попробуйте снова.")
-    
-    await state.clear()
+@dp.callback_query(F.data == "back_to_catalog")
+async def back_to_catalog(callback: CallbackQuery):
+    categories = get_categories()
+    await callback.message.edit_text("📋 *Выберите категорию:*", reply_markup=get_categories_keyboard(categories), parse_mode="Markdown")
+    await callback.answer()
 
-@dp.callback_query(F.data == "cancel_order", OrderStates.waiting_for_confirmation)
-async def cancel_order_handler(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("❌ Заказ отменён.\n\nВы можете продолжить покупки.", reply_markup=get_main_keyboard())
-    await state.clear()
-
-@dp.message(F.text == "📦 Мои заказы")
-async def show_orders(message: Message):
-    user_id = message.from_user.id
-    orders = get_user_orders(user_id)
-    if not orders:
-        await message.answer("📭 У вас пока нет заказов.")
-        return
-    status_emoji = {'pending': '⏳', 'paid': '✅', 'delivered': '🚚', 'cancelled': '❌'}
-    text = "📦 *Ваши заказы:*\n\n"
-    for order in orders:
-        status = status_emoji.get(order['status'], '📌')
-        delivery_icon = "📍" if order['delivery_method'] == 'pickup' else "🚛"
-        text += (f"{status} *Заказ #{order['id']}*\n"
-                f"📦 {order['product_name']} — {order['quantity']} {order['unit']}\n"  # <--- ЗДЕСЬ ИСПРАВЛЕНО!
-                f"💰 {order['total_price']} сум\n"
-                f"{delivery_icon} {order['delivery_method']}\n"
-                f"🕐 {order['created_at'][:16]}\n\n")
-    await message.answer(text, parse_mode="Markdown")
-
+# ---------- Профиль ----------
 @dp.message(F.text == "👤 Профиль")
 async def show_profile(message: Message):
-    user = get_user(message.from_user.id)
+    user = get_user_by_telegram_id(message.from_user.id)
     if not user:
-        await message.answer("❌ Ошибка: пользователь не найден.")
+        await message.answer("❌ Ошибка.")
         return
-    role_name = {'buyer': 'Покупатель', 'farmer': 'Фермер', 'admin': 'Администратор'}.get(user['role'], user['role'])
-    text = (f"👤 *Ваш профиль*\n\n"
-            f"🆔 ID: {user['user_id']}\n"
-            f"📝 Имя: {user['full_name'] or 'Не указано'}\n"
-            f"🔑 Роль: {role_name}\n"
-            f"📅 Зарегистрирован: {user['registered_at'][:16]}")
+    role_names = {'buyer': 'Покупатель', 'gardener': 'Садовод', 'farmer': 'Фермер', 'delivery': 'Доставщик', 'manager': 'Менеджер', 'admin': 'Администратор'}
+    text = f"👤 *Профиль*\n🆔 {user['user_id']}\n📝 {user.get('full_name', 'Не указано')}\n🔑 {role_names.get(user['role'], user['role'])}"
+    
+    # Доп. информация для садовода/фермера
+    if user['role'] == 'gardener':
+        gardener = supabase.table("gardeners").select("*").eq("user_id", user['user_id']).execute()
+        if gardener.data:
+            text += f"\n🏠 Сад: {gardener.data[0].get('garden_name', '-')}\n📍 {gardener.data[0].get('address', '-')}"
+    elif user['role'] == 'farmer':
+        farmer = supabase.table("farmers").select("*").eq("user_id", user['user_id']).execute()
+        if farmer.data:
+            text += f"\n🌾 Хозяйство: {farmer.data[0].get('farm_name', '-')}\n📍 {farmer.data[0].get('address', '-')}"
+    
     await message.answer(text, parse_mode="Markdown")
 
-@dp.message()
-async def unknown_message(message: Message):
+# ---------- Помощь ----------
+@dp.message(F.text == "❓ Помощь")
+async def show_help(message: Message):
     await message.answer(
-        "❓ Я не понимаю эту команду.\n"
-        "Пожалуйста, воспользуйтесь кнопками меню или отправьте /help.",
-        reply_markup=get_main_keyboard()
+        "❓ *Помощь*\n\n"
+        "🛒 Каталог — просмотр товаров\n"
+        "🛍️ Корзина — оформление заказа\n"
+        "📦 Мои заказы — история\n"
+        "👤 Профиль — ваши данные\n\n"
+        "По вопросам: @paliz_support",
+        parse_mode="Markdown"
     )
 
-# ==================== ЗАПУСК ДЛЯ RENDER ====================
+# ---------- Неизвестные команды ----------
+@dp.message()
+async def unknown_message(message: Message):
+    await message.answer("❓ Используйте кнопки меню или /help.", reply_markup=get_main_keyboard())
 
+# ---------- HTTP Keep-Alive ----------
+async def handle_health(request):
+    return web.Response(text="✅ Bot is running!")
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get('/health', handle_health)
+    app.router.add_get('/', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080)))
+    await site.start()
+    logging.info("✅ HTTP сервер запущен")
+
+# ---------- ЗАПУСК ----------
 async def main():
-    # Инициализируем базу данных
-    init_db()
-    
-    # Запускаем HTTP-сервер для Keep-Alive (чтобы Render не вырубался)
     asyncio.create_task(start_http_server())
     
-    # Для Render используем webhook
     webhook_url = os.getenv("WEBHOOK_URL")
     if webhook_url:
         await bot.set_webhook(webhook_url)
         logging.info(f"✅ Webhook установлен: {webhook_url}")
     else:
-        # Для локальной разработки - polling
         await bot.delete_webhook(drop_pending_updates=True)
+        logging.info("✅ Запуск в режиме polling")
+        await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
         logging.info("✅ Запуск в режиме polling (локальная разработка)")
         await dp.start_polling(bot)
 
