@@ -1,6 +1,6 @@
-﻿"""
+"""
 Paliz Market Bot - Полная версия
-С ролями, геолокацией, Supabase, каталогом, сортировкой
+С ролями, геолокацией, сменой ролей, Supabase
 """
 
 import asyncio
@@ -238,15 +238,13 @@ def get_categories() -> List[Dict]:
         return []
 
 def get_all_products_with_sellers() -> List[Dict]:
-    """Получить все товары с полной информацией о продавце (фермеры + садоводы)"""
+    """Получить все товары с полной информацией о продавце"""
     try:
-        # Товары фермеров
         farmer_products = supabase.table("products")\
             .select("*, farmers!inner(user_id, farm_name, address, latitude, longitude, phone)")\
             .eq("is_active", True)\
             .execute()
         
-        # Товары садоводов
         gardener_products = supabase.table("products")\
             .select("*, gardeners!inner(user_id, garden_name, address, latitude, longitude, phone)")\
             .eq("is_active", True)\
@@ -450,6 +448,17 @@ def get_role_keyboard() -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
+def get_change_role_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора роли для смены"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛒 Покупатель", callback_data="change_to_buyer")
+    builder.button(text="🏠 Садовод", callback_data="change_to_gardener")
+    builder.button(text="🌾 Фермер (заявка)", callback_data="change_to_farmer")
+    builder.button(text="🚚 Доставщик (заявка)", callback_data="change_to_delivery")
+    builder.button(text="🔙 Назад", callback_data="back_to_profile")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def get_location_keyboard() -> ReplyKeyboardMarkup:
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
@@ -622,6 +631,27 @@ async def cmd_start(message: Message, state: FSMContext):
     else:
         await show_main_menu(message, user)
 
+# ---------- /reset ----------
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Удаляем пользователя из всех таблиц
+    supabase.table("users").delete().eq("user_id", user_id).execute()
+    supabase.table("gardeners").delete().eq("user_id", user_id).execute()
+    supabase.table("farmers").delete().eq("user_id", user_id).execute()
+    supabase.table("delivery_profiles").delete().eq("user_id", user_id).execute()
+    supabase.table("farmer_requests").delete().eq("user_id", user_id).execute()
+    supabase.table("delivery_requests").delete().eq("user_id", user_id).execute()
+    supabase.table("cart").delete().eq("user_id", user_id).execute()
+    
+    await state.clear()
+    await message.answer(
+        "✅ *Ваш аккаунт полностью сброшен!*\n\n"
+        "Напишите /start для повторной регистрации.",
+        parse_mode="Markdown"
+    )
+
 # ---------- /admin ----------
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
@@ -653,24 +683,24 @@ async def process_role_selection(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         
     elif role == "gardener":
-        await state.update_data(role="gardener")
+        await state.update_data(role="gardener", is_change=False)
         await state.set_state(RegistrationStates.waiting_for_gardener_name)
         await callback.message.edit_text("🏠 *Регистрация садовода*\n\nВведите название вашего сада:", parse_mode="Markdown")
         await callback.answer()
         
     elif role == "farmer":
-        await state.update_data(role="farmer")
+        await state.update_data(role="farmer", is_change=False)
         await state.set_state(RegistrationStates.waiting_for_farmer_name)
         await callback.message.edit_text("🌾 *Регистрация фермера*\n\nВведите название хозяйства:", parse_mode="Markdown")
         await callback.answer()
         
     elif role == "delivery":
-        await state.update_data(role="delivery")
+        await state.update_data(role="delivery", is_change=False)
         await state.set_state(RegistrationStates.waiting_for_delivery_name)
         await callback.message.edit_text("🚚 *Регистрация доставщика*\n\nВведите ваше ФИО:", parse_mode="Markdown")
         await callback.answer()
 
-# ---------- Садовод (с геолокацией) ----------
+# ---------- Садовод ----------
 @dp.message(RegistrationStates.waiting_for_gardener_name)
 async def process_gardener_name(message: Message, state: FSMContext):
     await state.update_data(garden_name=message.text)
@@ -689,8 +719,7 @@ async def process_gardener_phone(message: Message, state: FSMContext):
     await state.set_state(RegistrationStates.waiting_for_gardener_location)
     await message.answer(
         "📍 *Отправьте геолокацию вашего сада/огорода*\n\n"
-        "Нажмите на кнопку ниже и отправьте местоположение на карте.\n\n"
-        "Это нужно, чтобы покупатели видели расстояние до вас.",
+        "Нажмите на кнопку ниже и отправьте местоположение на карте.",
         reply_markup=get_location_keyboard(),
         parse_mode="Markdown"
     )
@@ -700,20 +729,34 @@ async def process_gardener_location(message: Message, state: FSMContext):
     data = await state.get_data()
     latitude = message.location.latitude
     longitude = message.location.longitude
+    is_change = data.get('is_change', False)
     
-    add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "gardener")
-    add_gardener(message.from_user.id, data['garden_name'], data['address'], data['phone'], latitude, longitude)
-    
-    await message.answer(
-        "✅ *Вы успешно зарегистрированы как Садовод!*\n\n"
-        "📍 Ваша геолокация сохранена. Теперь покупатели могут видеть расстояние до вас.\n\n"
-        "➕ Используйте кнопку 'Добавить товар', чтобы начать продавать.",
-        reply_markup=get_main_keyboard("gardener"),
-        parse_mode="Markdown"
-    )
+    if is_change:
+        supabase.table("gardeners").upsert({
+            "user_id": message.from_user.id,
+            "garden_name": data['garden_name'],
+            "address": data['address'],
+            "phone": data['phone'],
+            "latitude": latitude,
+            "longitude": longitude
+        }).execute()
+        update_user_role(message.from_user.id, "gardener")
+        await message.answer(
+            "✅ *Роль успешно изменена на Садовод!*",
+            reply_markup=get_main_keyboard("gardener"),
+            parse_mode="Markdown"
+        )
+    else:
+        add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "gardener")
+        add_gardener(message.from_user.id, data['garden_name'], data['address'], data['phone'], latitude, longitude)
+        await message.answer(
+            "✅ *Вы успешно зарегистрированы как Садовод!*",
+            reply_markup=get_main_keyboard("gardener"),
+            parse_mode="Markdown"
+        )
     await state.clear()
 
-# ---------- Фермер (заявка с геолокацией) ----------
+# ---------- Фермер ----------
 @dp.message(RegistrationStates.waiting_for_farmer_name)
 async def process_farmer_name(message: Message, state: FSMContext):
     await state.update_data(farm_name=message.text)
@@ -732,8 +775,7 @@ async def process_farmer_phone(message: Message, state: FSMContext):
     await state.set_state(RegistrationStates.waiting_for_farmer_location)
     await message.answer(
         "📍 *Отправьте геолокацию вашего хозяйства*\n\n"
-        "Нажмите на кнопку ниже и отправьте местоположение на карте.\n\n"
-        "Это нужно для отображения расстояния до покупателей.",
+        "Нажмите на кнопку ниже и отправьте местоположение на карте.",
         reply_markup=get_location_keyboard(),
         parse_mode="Markdown"
     )
@@ -743,17 +785,25 @@ async def process_farmer_location(message: Message, state: FSMContext):
     data = await state.get_data()
     latitude = message.location.latitude
     longitude = message.location.longitude
+    is_change = data.get('is_change', False)
     
-    add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "buyer")
-    add_farmer_request(message.from_user.id, data['farm_name'], data['address'], data['phone'], latitude, longitude)
-    
-    await message.answer(
-        "✅ *Заявка отправлена менеджеру!*\n\n"
-        "📍 Ваша геолокация сохранена в заявке.\n\n"
-        "После одобрения вы сможете добавлять товары.",
-        reply_markup=get_main_keyboard("buyer"),
-        parse_mode="Markdown"
-    )
+    if is_change:
+        add_farmer_request(message.from_user.id, data['farm_name'], data['address'], data['phone'], latitude, longitude)
+        await message.answer(
+            "✅ *Заявка на роль фермера отправлена!*\n\n"
+            "Менеджер рассмотрит вашу заявку.",
+            reply_markup=get_main_keyboard("buyer"),
+            parse_mode="Markdown"
+        )
+    else:
+        add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "buyer")
+        add_farmer_request(message.from_user.id, data['farm_name'], data['address'], data['phone'], latitude, longitude)
+        await message.answer(
+            "✅ *Заявка отправлена менеджеру!*\n\n"
+            "После одобрения вы сможете добавлять товары.",
+            reply_markup=get_main_keyboard("buyer"),
+            parse_mode="Markdown"
+        )
     
     await send_notification_to_managers(
         f"🔔 *Новая заявка фермера!*\n\n"
@@ -765,7 +815,7 @@ async def process_farmer_location(message: Message, state: FSMContext):
     )
     await state.clear()
 
-# ---------- Доставщик (заявка с геолокацией) ----------
+# ---------- Доставщик ----------
 @dp.message(RegistrationStates.waiting_for_delivery_name)
 async def process_delivery_name(message: Message, state: FSMContext):
     await state.update_data(full_name=message.text)
@@ -794,16 +844,24 @@ async def process_delivery_location(message: Message, state: FSMContext):
     data = await state.get_data()
     latitude = message.location.latitude
     longitude = message.location.longitude
+    is_change = data.get('is_change', False)
     
-    add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "buyer")
-    add_delivery_request(message.from_user.id, data['full_name'], data['phone'], data['vehicle_type'], latitude, longitude)
-    
-    await message.answer(
-        "✅ *Заявка отправлена менеджеру!*\n\n"
-        "После одобрения вы сможете принимать заказы на доставку.",
-        reply_markup=get_main_keyboard("buyer"),
-        parse_mode="Markdown"
-    )
+    if is_change:
+        add_delivery_request(message.from_user.id, data['full_name'], data['phone'], data['vehicle_type'], latitude, longitude)
+        await message.answer(
+            "✅ *Заявка на роль доставщика отправлена!*\n\n"
+            "Менеджер рассмотрит вашу заявку.",
+            reply_markup=get_main_keyboard("buyer"),
+            parse_mode="Markdown"
+        )
+    else:
+        add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, "buyer")
+        add_delivery_request(message.from_user.id, data['full_name'], data['phone'], data['vehicle_type'], latitude, longitude)
+        await message.answer(
+            "✅ *Заявка отправлена менеджеру!*",
+            reply_markup=get_main_keyboard("buyer"),
+            parse_mode="Markdown"
+        )
     
     await send_notification_to_managers(
         f"🔔 *Новая заявка доставщика!*\n\n"
@@ -1150,32 +1208,147 @@ async def back_to_catalog(callback: CallbackQuery):
 async def show_profile(message: Message):
     user = get_user_by_telegram_id(message.from_user.id)
     if not user:
-        await message.answer("❌ Ошибка.")
+        await message.answer("❌ Ошибка: пользователь не найден.")
         return
-    role_names = {'buyer': 'Покупатель', 'gardener': 'Садовод', 'farmer': 'Фермер', 'delivery': 'Доставщик', 'manager': 'Менеджер', 'admin': 'Администратор'}
-    text = f"👤 *Профиль*\n🆔 {user['user_id']}\n📝 {user.get('full_name', 'Не указано')}\n🔑 {role_names.get(user['role'], user['role'])}"
     
-    # Доп. информация для садовода/фермера
+    role_names = {
+        'buyer': '🛒 Покупатель',
+        'gardener': '🏠 Садовод',
+        'farmer': '🌾 Фермер',
+        'delivery': '🚚 Доставщик',
+        'manager': '👤 Менеджер',
+        'admin': '⚙️ Администратор'
+    }
+    
+    text = (
+        f"👤 *Ваш профиль*\n\n"
+        f"🆔 ID: {user['user_id']}\n"
+        f"📝 Имя: {user.get('full_name', 'Не указано')}\n"
+        f"🔑 Роль: {role_names.get(user['role'], user['role'])}\n"
+        f"📅 Зарегистрирован: {user.get('created_at', 'Неизвестно')[:16] if user.get('created_at') else 'Неизвестно'}"
+    )
+    
+    # Дополнительная информация для садовода/фермера
     if user['role'] == 'gardener':
         gardener = supabase.table("gardeners").select("*").eq("user_id", user['user_id']).execute()
         if gardener.data:
-            text += f"\n🏠 Сад: {gardener.data[0].get('garden_name', '-')}\n📍 {gardener.data[0].get('address', '-')}"
+            text += f"\n\n🏠 Сад: {gardener.data[0].get('garden_name', '-')}\n📍 {gardener.data[0].get('address', '-')}"
     elif user['role'] == 'farmer':
         farmer = supabase.table("farmers").select("*").eq("user_id", user['user_id']).execute()
         if farmer.data:
-            text += f"\n🌾 Хозяйство: {farmer.data[0].get('farm_name', '-')}\n📍 {farmer.data[0].get('address', '-')}"
+            text += f"\n\n🌾 Хозяйство: {farmer.data[0].get('farm_name', '-')}\n📍 {farmer.data[0].get('address', '-')}"
     
+    # Клавиатура с кнопкой смены роли
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Сменить роль", callback_data="change_role")
+    builder.adjust(1)
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+# ---------- Смена роли ----------
+@dp.callback_query(F.data == "change_role")
+async def change_role_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "🔄 *Смена роли*\n\n"
+        "Выберите новую роль:\n\n"
+        "🛒 **Покупатель** — покупка товаров\n"
+        "🏠 **Садовод** — продажа со своего сада (без проверки)\n"
+        "🌾 **Фермер** — продажа с фермы (нужна проверка)\n"
+        "🚚 **Доставщик** — доставка заказов (нужна проверка)",
+        reply_markup=get_change_role_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "change_to_buyer")
+async def change_to_buyer(callback: CallbackQuery):
+    update_user_role(callback.from_user.id, "buyer")
+    await callback.message.answer(
+        "✅ *Вы сменили роль на Покупатель!*",
+        reply_markup=get_main_keyboard("buyer"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "change_to_gardener")
+async def change_to_gardener_start(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(role="gardener", is_change=True)
+    await state.set_state(RegistrationStates.waiting_for_gardener_name)
+    await callback.message.answer(
+        "🏠 *Регистрация садовода*\n\n"
+        "Введите название вашего сада или огорода:",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "change_to_farmer")
+async def change_to_farmer_start(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(role="farmer", is_change=True)
+    await state.set_state(RegistrationStates.waiting_for_farmer_name)
+    await callback.message.answer(
+        "🌾 *Регистрация фермера*\n\n"
+        "Введите название вашего хозяйства:",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "change_to_delivery")
+async def change_to_delivery_start(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(role="delivery", is_change=True)
+    await state.set_state(RegistrationStates.waiting_for_delivery_name)
+    await callback.message.answer(
+        "🚚 *Регистрация доставщика*\n\n"
+        "Введите ваше ФИО:",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_profile")
+async def back_to_profile(callback: CallbackQuery):
+    await callback.message.delete()
+    await show_profile(callback.message)
+    await callback.answer()
+
+# ---------- Мои заказы ----------
+@dp.message(F.text == "📦 Мои заказы")
+async def show_orders(message: Message):
+    orders = get_user_orders(message.from_user.id)
+    if not orders:
+        await message.answer("📭 У вас пока нет заказов.")
+        return
+    
+    status_emoji = {
+        'pending': '⏳ Ожидает',
+        'paid': '✅ Оплачен',
+        'preparing': '👨‍🍳 Готовится',
+        'delivery': '🚚 В доставке',
+        'delivered': '📦 Доставлен',
+        'cancelled': '❌ Отменён'
+    }
+    
+    text = "📦 *Ваши заказы:*\n\n"
+    for order in orders:
+        status = status_emoji.get(order.get('status', 'pending'), order.get('status', 'pending'))
+        text += (
+            f"🆔 *Заказ #{order.get('id', '?')}*\n"
+            f"💵 Сумма: {order.get('total_amount', 0)}₽\n"
+            f"📊 Статус: {status}\n"
+            f"🕐 {order.get('created_at', '')[:16]}\n\n"
+        )
     await message.answer(text, parse_mode="Markdown")
 
 # ---------- Помощь ----------
 @dp.message(F.text == "❓ Помощь")
+@dp.message(Command("help"))
 async def show_help(message: Message):
     await message.answer(
         "❓ *Помощь*\n\n"
-        "🛒 Каталог — просмотр товаров\n"
-        "🛍️ Корзина — оформление заказа\n"
-        "📦 Мои заказы — история\n"
-        "👤 Профиль — ваши данные\n\n"
+        "🛒 **Каталог** — просмотр товаров с сортировкой по цене и расстоянию\n"
+        "🛍️ **Корзина** — оформление заказа\n"
+        "📦 **Мои заказы** — история заказов\n"
+        "👤 **Профиль** — ваши данные и смена роли\n\n"
+        "📍 *Для сортировки по расстоянию* поделитесь геолокацией в каталоге.\n\n"
         "По вопросам: @paliz_support",
         parse_mode="Markdown"
     )
@@ -1183,22 +1356,28 @@ async def show_help(message: Message):
 # ---------- Неизвестные команды ----------
 @dp.message()
 async def unknown_message(message: Message):
-    await message.answer("❓ Используйте кнопки меню или /help.", reply_markup=get_main_keyboard())
+    user = get_user_by_telegram_id(message.from_user.id)
+    role = user.get("role", "buyer") if user else "buyer"
+    await message.answer(
+        "❓ Я не понимаю эту команду.\n"
+        "Пожалуйста, воспользуйтесь кнопками меню или /help.",
+        reply_markup=get_main_keyboard(role)
+    )
 
 # ---------- HTTP Keep-Alive ----------
 async def handle_health(request):
     return web.Response(text="✅ Bot is running!")
 
 async def start_http_server():
+    port = int(os.environ.get('PORT', 10000))
     app = web.Application()
     app.router.add_get('/health', handle_health)
     app.router.add_get('/', handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get('PORT', 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logging.info("✅ HTTP сервер запущен")
+    logging.info(f"✅ HTTP сервер запущен на порту {port}")
 
 # ---------- ЗАПУСК ----------
 async def main():
@@ -1211,11 +1390,6 @@ async def main():
     else:
         await bot.delete_webhook(drop_pending_updates=True)
         logging.info("✅ Запуск в режиме polling")
-        await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-        logging.info("✅ Запуск в режиме polling (локальная разработка)")
         await dp.start_polling(bot)
 
 if __name__ == "__main__":
